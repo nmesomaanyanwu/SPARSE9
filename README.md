@@ -6,6 +6,8 @@ implementation. It is optimized for one thing: **correctness**. It is the
 baseline you keep forever — the thing a future fast version gets benchmarked
 and differential-tested against.
 
+> **Design notes:** I write about the decisions behind this project at [The Latency Log](https://nmesomaanyanwu.hashnode.dev).
+
 ---
 
 ## What it does
