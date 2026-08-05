@@ -1,265 +1,275 @@
-# Matching Engine — Phase 1 (correctness-first baseline)
+# SPARSE9 — Limit Order Book & Matching Engine
 
-A single-threaded limit-order-book matching engine built on `std::map` +
-`std::list`. This is the **deliberately obvious, clear, slightly-slow**
-implementation. It is optimized for one thing: **correctness**. It is the
-baseline you keep forever — the thing a future fast version gets benchmarked
-and differential-tested against.
+A limit order book and matching engine in C++20, with a TCP order-entry gateway
+and a single-writer concurrency model. Full price-time priority with LIMIT,
+MARKET, IOC and FOK semantics, and O(1) cancellation.
 
-> **Design notes:** I write about the decisions behind this project at [The Latency Log](https://nmesomaanyanwu.hashnode.dev).
+The matching **core** processes an order in a **median of 84 ns** (p99 584 ns).
+Wrapped in the full TCP path, **end-to-end order-to-ack** over loopback is a
+**median of 14.6 µs** (p99 43.7 µs). Those are two different measurements of two
+different things — read [Benchmarks](#benchmarks) before comparing either to
+anything, because the conditions (macOS, loopback, no core isolation) matter a
+lot.
 
----
-
-## What it does
-
-- Full **price-time priority**: better price first, oldest-first (FIFO) within a
-  price level.
-- **Maker-price execution**: a trade prints at the resting (maker) order's
-  price, never the aggressor's limit.
-- Order types: **LIMIT** and **MARKET**.
-- Time-in-force: **GTC**, **Day**, **IOC**, **FOK**.
-- `O(1)` **cancel** via an `OrderId → Locator` index.
-- Deterministic: the same input sequence always produces the same trades.
-
-### Order-type / time-in-force semantics
-
-The type and TIF are just instructions about what to do with the **remainder**
-after matching:
-
-| Kind          | Crosses at          | Unfilled remainder        |
-|---------------|---------------------|---------------------------|
-| LIMIT + GTC   | its limit price     | rests in the book         |
-| LIMIT + Day   | its limit price     | rests in the book¹        |
-| LIMIT + IOC   | its limit price     | cancelled (never rests)   |
-| LIMIT + FOK   | its limit price     | all-or-nothing²           |
-| MARKET        | any price           | dropped (never rests)     |
-
-¹ `Day` behaves like `GTC` in Phase 1 — there is no session clock yet.
-² **FOK** runs a pre-check first: it counts crossing liquidity by *quantity*;
-if the whole order can't fill, it touches nothing and returns no trades.
+Design notes and write-ups: [The Latency Log](https://nmesomaanyanwu.hashnode.dev)
 
 ---
 
-## Layout
+## Contents
 
-```
-include/
-  types.hpp          Price / Quantity / OrderId / TradeId aliases (int64 ticks)
-  order_side.hpp     enum class OrderSide { BUY, SELL }
-  order_type.hpp     enum class OrderType { LIMIT, MARKET }
-  time_in_force.hpp  enum class TimeInForce { GTC, IOC, Day, FOK }
-  order.hpp          struct Order
-  trade.hpp          struct Trade  (+ Trade::create factory)
-  locator.hpp        struct Locator { side, price, list<Order>::iterator }
-  order_book.hpp     class OrderBook — the public API
-src/
-  orderBook.cpp      the engine implementation
-  main.cpp           a small hand-driven demo
-test/
-  test_order_book.cpp  dependency-free edge-case suite (23 tests)
-```
-
-### How the book is stored
-
-```
-asks_  : std::map<Price, std::list<Order>>                 ascending  → begin() = best (lowest)  ask
-bids_  : std::map<Price, std::list<Order>, std::greater<>> descending → begin() = best (highest) bid
-index_ : std::unordered_map<OrderId, Locator>              O(1) cancel lookup
-```
-
-**Ownership.** The book owns every resting `Order`; it lives inside the
-`std::list` at its price level. The `Locator` in `index_` holds a
-`std::list<Order>::iterator` to that node — valid because a list iterator
-survives insertion and erasure of *other* nodes in the same list. That's the
-whole trick that makes `cancel` `O(1)` instead of `O(n)`.
+- [Benchmarks](#benchmarks)
+- [Architecture](#architecture)
+- [Design decisions](#design-decisions)
+- [Matching semantics](#matching-semantics)
+- [Correctness](#correctness)
+- [Build and run](#build-and-run)
+- [Limitations](#limitations)
 
 ---
 
-## Public API
+## Benchmarks
 
-```cpp
-std::vector<Trade>   submit(Order incoming);   // match, then rest/cancel/drop the remainder
-bool                 cancel(OrderId id);       // remove a resting order; false if not found
-std::optional<Price> best_bid() const;         // nullopt if the bid side is empty
-std::optional<Price> best_ask() const;         // nullopt if the ask side is empty
+There are **three** measurements, each isolating a different layer. They share
+one seeded workload generator (`bench/workload.hpp`), so the only thing that
+changes between them is the transport.
 
-// introspection (handy for tests / debugging)
-bool     contains(OrderId id) const;
-Quantity quantity_at(OrderSide side, Price price) const;
+### 1. Matching core, in-process (`bench_core`)
+
+No queue, no thread hand-off, no socket — a direct call into `OrderBook` on the
+thread that owns it. This is the floor.
+
+| Metric | Value |
+| --- | --- |
+| Orders measured | 10,000,000 |
+| Median (p50) | 84 ns |
+| p99 | 584 ns |
+| p99.9 | 916 ns |
+| Throughput (single thread) | 5.1 M orders/sec |
+
+### 2. Order-to-ack across the single-writer boundary, in-process (`bench_pipe`)
+
+Producer thread → bounded MPSC queue → matching thread → ack. Still no socket.
+This is the cost the queue and the thread hand-off add on top of the core.
+
+| Metric | Value |
+| --- | --- |
+| Orders measured | 5,000,000 |
+| Median (p50) | 292 ns |
+| p99 | 875 ns |
+| p99.9 | 1.75 µs |
+| Saturated throughput | 6.4 M orders/sec |
+
+### 3. End-to-end order-to-ack over TCP loopback (`bench_tcp`) — the headline
+
+Client `send()` of a length-prefixed order frame → gateway parse → MPSC queue →
+matching thread → ack frame → client `recv()`.
+
+| Metric | Value |
+| --- | --- |
+| Orders measured | 1,000,000 |
+| Median (p50) | 14.6 µs |
+| p99 | 43.7 µs |
+| p99.9 | 68.9 µs |
+| Throughput, 1 order in flight | 62.6 k orders/sec |
+| Throughput, pipelined | 145 k orders/sec |
+
+**What is being measured (measurement 3).** A steady-clock timestamp is taken on
+the client immediately before `send()` writes the order frame to the socket, and
+again immediately after `recv()` returns the matching ack frame. The reported
+figure is the difference: one full round trip, single order in flight.
+
+**Conditions.** Single producer, single connection, one order in flight, steady
+state, warm cache. Latencies include ~41 ns of `steady_clock::now()` overhead
+per sample (measured and reported by the harness).
+
+| | |
+| --- | --- |
+| CPU | Apple M5 (10 cores), Mac17,3 |
+| Cores pinned / isolated | **None** — macOS gives no `isolcpus`/affinity equivalent; threads float across cores under the normal scheduler |
+| OS / kernel | macOS 26.5.1, Darwin 25.5.0 |
+| Compiler and flags | Apple clang 21.0.0, C++20, `-O3` (CMake `Release`), `-Wall -Wextra -Werror` |
+| Network path | TCP over the **loopback** interface, same host — not a physical NIC |
+| Clock source | `std::chrono::steady_clock` (~41 ns/call on this machine) |
+| Book state | ~5,000 resting orders, held steady across a ±500-tick price band |
+| Order mix | ≈33% resting adds, ≈33% marketable IOC takes, ≈33% cancels, seeded RNG (`seed=42`) |
+
+**Where the time goes.** Stacking the three measurements attributes the latency
+cleanly:
+
+```
+  matching core .................   84 ns   (measurement 1)
+  + MPSC queue + thread hand-off .  292 ns   (measurement 2, cumulative)
+  + TCP loopback round trip ...... 14.6 µs   (measurement 3, cumulative)
 ```
 
-`submit` takes the order **by value** on purpose: matching mutates its
-remaining quantity, and any leftover may rest in the book.
+The matching work is ~0.6% of the end-to-end median. **Essentially all** of the
+14.6 µs is the socket path: the `send()`/`recv()` syscalls, the loopback network
+stack, and the thread wake-ups the hand-off implies. That is the honest story
+here — a fast matching core behind an un-tuned, portable, blocking-socket gateway
+on a general-purpose OS.
 
----
+Why is p99 (~44 µs) roughly 3× the median? On this setup it is scheduler jitter:
+with no core pinning, the producer, gateway and matching threads are migrated and
+occasionally descheduled, and a wake-up that lands after a context switch pays for
+it. The max samples (hundreds of µs) line up with that. What I would measure next
+to confirm it: sample scheduler/context-switch events and correlate them with the
+tail, then re-run with threads pinned (which needs Linux) to see whether the tail
+collapses.
 
-## Requirements
-
-- A C++20 compiler (`clang++` or `g++`)
-- CMake ≥ 3.20
-
----
-
-## Running the program (the demo)
-
-The demo (`src/main.cpp`) rests a couple of orders, fires an aggressive buy that
-sweeps the book, then cancels the leftover — printing the trades and top-of-book
-at each step.
-
-**Step 1 — configure the build** (once, or after editing `CMakeLists.txt`):
+**Reproducing.**
 
 ```bash
-cmake -S . -B build
-```
-
-**Step 2 — compile everything:**
-
-```bash
+git clone https://github.com/nmesomaanyanwu/SPARSE9.git   # or your local path
+cd SPARSE9
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+
+./build/bench_core 10000000 5000 42   # measurement 1
+./build/bench_pipe  5000000 5000 42   # measurement 2
+./build/bench_tcp   1000000 5000 42   # measurement 3  (loopback, ~16 s)
 ```
 
-**Step 3 — run the demo:**
+Arguments are `[num_ops] [target_depth] [seed]`. Numbers above are from a single
+run each; expect small run-to-run variation on an un-isolated machine. A 10 M
+end-to-end run reproduces the same median (p50 15.2 µs, p99 47.6 µs) — the table
+uses 1 M only because loopback round trips cap throughput at ~60 k/s.
+
+---
+
+## Architecture
+
+```
+  TCP clients            gateway thread (1 per conn)        matching thread
+ ───────────────  bytes  ──────────────────────────  MPSC  ──────────────────
+  producer 1  ──────────▶ read length-prefixed frame ─────▶  owns book memory
+  producer 2  ──────────▶ parse, assign order id     ─────▶  submit / cancel
+      ...                 push request onto queue            write ack to socket
+```
+
+**Order entry.** A TCP gateway speaks a binary, length-prefixed wire protocol
+(`include/wire.hpp`): every frame is `[uint32 length][payload]`. Order IDs are
+64-bit and producer-partitioned — the top 16 bits are a per-connection producer
+id, the low 48 a per-producer counter — so producers mint globally-unique IDs
+without coordinating.
+
+**Isolation.** Networking is separated from the matching core by a bounded
+multi-producer, single-consumer queue (`include/mpsc_queue.hpp`, Vyukov's bounded
+ring). The matching **core** (`OrderBook`) has no knowledge of sockets, framing
+or clients, which keeps it directly unit-testable. The matching **thread**
+orchestrates: it dequeues, calls into the core, and writes the ack frame back to
+the originating socket.
+
+**Single-writer core.** Exactly one thread owns book memory. Producers (gateway
+threads) enqueue requests; they never touch the book. This structurally
+eliminates four failure modes rather than defending against them at runtime:
+
+| Failure mode | Why it cannot occur |
+| --- | --- |
+| Torn quantity updates | Only one thread ever writes an order's fields |
+| Dangling best-price pointers | Level erase and pointer update happen in one thread, in order |
+| Scrambled time priority | Queue order into the matcher *is* arrival order |
+| Deadlock | The matching core takes no locks |
+
+---
+
+## Design decisions
+
+The single-writer model was chosen over three alternatives. **These rejections
+are reasoned, not measured** — I did not implement the global-lock or
+per-level-lock variants and benchmark them; I ruled them out on analysis before
+building. That distinction matters, so I am stating it plainly.
+
+**Global lock over the whole book.** Simple and obviously correct, but every
+producer serialises on one mutex, so throughput collapses under contention and
+tail latency becomes dominated by lock-wait rather than matching work. The
+matching work here is ~84 ns, so an uncontended mutex round trip is already the
+same order of magnitude, and a contended one dwarfs it.
+
+**Per-price-level locking.** Finer-grained, but a marketable order that sweeps
+several levels must hold or hand off locks across levels in price order, which
+reintroduces lock-ordering complexity and races on level creation/destruction.
+Worse, time priority is no longer guaranteed by arrival order once independent
+levels progress concurrently — the property the book exists to provide.
+
+**Lock-free shared book.** Attractive on paper. Rejected as unverifiable at this
+scale: correct CAS sequences against ABA hazards, the acquire-release ordering
+between price-level and order-node updates, and safe memory reclamation for
+erased nodes together produce a design I could not convince myself was correct
+and could not test into confidence.
+
+The chosen design gives the same guarantees while leaving the matching core and
+its full test suite unchanged — the concurrency and networking layers were added
+on top of the correctness-first core without editing a line of it.
+
+---
+
+## Matching semantics
+
+- **Price-time priority** across all order types
+- **Maker-price execution** — crossing trades execute at the resting order's price
+- **LIMIT**, **MARKET**, **IOC**, **FOK** (× GTC / Day time-in-force)
+- **O(1) cancellation** via an `OrderId → Locator` index holding stable
+  `std::list` iterators, so a cancel never searches the book
+- **FOK** is pre-checked against crossing liquidity by quantity before any
+  mutation, so a kill touches nothing
+
+---
+
+## Correctness
+
+The matching core is covered by **23 tests** in `test/test_order_book.cpp`,
+dependency-free and wired into CTest. They cover, among others:
+
+- resting vs. crossing limits, exact / partial / remainder fills
+- maker-price execution and FIFO time priority within a level
+- multi-level sweeps
+- cancel: resting, unknown id, partially-filled remainder, one-of-many at a level
+- IOC fill-then-cancel and IOC-with-no-liquidity
+- MARKET taking best and never resting; MARKET dropping unfilled remainder
+- FOK fully-fillable, unfillable, limit-price-respecting, exact-boundary
+- sell aggressor hitting bids; deterministic replay
+
+The concurrency and networking layers were added **without modifying the matching
+core**, and this pre-existing suite passes unchanged — the concrete evidence that
+the isolation boundary actually holds.
 
 ```bash
-./build/matching_engine
-```
-
-Expected output:
-
-```
-Resting two asks: 10@101 (id 1), 5@102 (id 2)
-  (no trades)
-  (no trades)
-  book: best_bid=-  best_ask=101
-
-Aggressive buy 12@102 (id 3) -- sweeps 101 then part of 102:
-  TRADE #1: buy 3 x sell 1  10 @ 101
-  TRADE #2: buy 3 x sell 2  2 @ 102
-  book: best_bid=-  best_ask=102
-
-Cancel remaining ask id 2:
-  cancel returned true
-  book: best_bid=-  best_ask=-
+ctest --test-dir build
 ```
 
 ---
 
-## Running the tests
-
-The tests live in their own folder:
-
-```
-test/
-  test_order_book.cpp   dependency-free edge-case suite (23 tests)
-```
-
-They need no external framework (no GoogleTest, no Catch2) — just a compiler.
-There are two ways to run them.
-
-### Option A — via CMake + CTest (recommended)
-
-After `cmake --build build` (see above), run:
+## Build and run
 
 ```bash
-ctest --test-dir build --output-on-failure
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+
+./build/matching_engine        # hand-driven in-process demo
+./build/matching_server 9001   # standalone TCP gateway on 127.0.0.1:9001
 ```
 
-Expected:
-
-```
-100% tests passed, 0 tests failed out of 1
-```
-
-To see the per-check summary the test binary itself prints, run it directly:
-
-```bash
-./build/order_book_tests
-```
-
-### Option B — one compiler command (no CMake)
-
-Compile the engine and the test file together and run the result:
-
-```bash
-c++ -std=c++20 -Wall -Wextra -Iinclude src/orderBook.cpp test/test_order_book.cpp -o build/tests
-./build/tests
-```
-
-Either way, the suite prints a summary and exits non-zero if anything fails
-(so it works in CI):
-
-```
-ALL PASSED: 109/109 checks passed across 23 tests.
-```
-
-### Adding your own test
-
-Open `test/test_order_book.cpp` and add a block using the `TEST(...)` macro and
-`CHECK(...)` assertions — it auto-registers, no wiring needed:
-
-```cpp
-TEST(my_new_case)
-{
-    OrderBook book;
-    book.submit(sell(1, 100, 5));
-    auto trades = book.submit(buy(2, 100, 5));
-    CHECK(trades.size() == 1);
-    CHECK(trades[0].price == 100);
-}
-```
-
-Rebuild and rerun with either option above.
+**Requirements:** a C++20 compiler (tested on Apple clang 21), CMake ≥ 3.20, and
+a POSIX platform for the gateway (Linux/macOS — it uses BSD sockets).
 
 ---
 
-## Using it in code
+## Limitations
 
-```cpp
-#include "order.hpp"
-#include "order_book.hpp"
+Named deliberately — these are the honest gaps, not oversights:
 
-OrderBook book;
-
-// Rest a sell (maker) at price 100 for 10 units.
-book.submit(Order{/*id*/1, OrderType::LIMIT, OrderSide::SELL, /*price*/100, /*qty*/10, TimeInForce::GTC});
-
-// Aggressive buy willing to pay up to 110 for 4 units.
-// Executes 4 @ 100 (the maker's price); 6 remain resting as an ask.
-std::vector<Trade> trades =
-    book.submit(Order{2, OrderType::LIMIT, OrderSide::BUY, 110, 4, TimeInForce::GTC});
-
-for (const Trade& t : trades)
-    // t.trade_id, t.buy_order_id, t.sell_order_id, t.price, t.quantity
-    ;
-
-book.cancel(1);            // remove the resting remainder
-auto ask = book.best_ask(); // std::optional<Price>
-```
-
----
-
-## Edge cases covered by the suite
-
-Each test is a small piece of documentation for a rule:
-
-- empty book (rests, no trades; empty tops)
-- non-crossing limit rests instead of trading
-- exact fill; incoming larger than resting; incoming smaller than resting
-- **maker-price** rule (trade at resting price, not aggressor's limit)
-- price-time priority (best price first, FIFO within a level)
-- a single order **sweeping three price levels**
-- cancel: plain, unknown-id, **partially-filled remainder**, one-of-many-at-a-level
-- **IOC**: fills then cancels remainder; no-liquidity no-op
-- **MARKET**: takes best, never rests, drops overflow
-- **FOK**: fully fillable executes; unfillable is a no-op; respects the limit
-  price; exact boundary executes
-- sell-aggressor mirror of the buy path
-- deterministic replay (same input → same trades)
-
----
-
-## Interview story
-
-> A correct matching engine with full order-type semantics — limit, market,
-> IOC, FOK — with price-time priority and maker-price execution, verified
-> against a suite of edge-case tests. Now I make it fast.
+- **Benchmarked on macOS / Apple Silicon over loopback**, with no core pinning or
+  isolation. Numbers would differ (likely lower median, far tighter tail) on
+  tuned Linux with `isolcpus` and pinned threads over a real NIC.
+- **Single symbol.** One book; no instrument routing.
+- **No persistence or recovery** — the book is in-memory only.
+- **No self-trade prevention.**
+- **No market-data publication** — only per-order acks, no book/trade feed.
+- **Blocking sockets, one gateway thread per connection** — correct and simple,
+  not tuned for very high connection counts (no `epoll`/`kqueue` event loop).
+- **The benchmark client predicts server-assigned order IDs** (it mirrors the
+  single connection's counter) so it can issue cancels; a real client would learn
+  IDs from acks instead.
+- **No wire-level endianness normalisation** — both ends are assumed same-ABI
+  (fine for loopback; a cross-host deployment must fix the wire to little-endian).

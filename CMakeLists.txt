@@ -14,6 +14,24 @@ target_include_directories(order_book PUBLIC include)
 add_executable(matching_engine src/main.cpp)
 target_link_libraries(matching_engine PRIVATE order_book)
 
+# Benchmarks (Release-optimised recommended: -DCMAKE_BUILD_TYPE=Release).
+add_executable(bench_core bench/bench_core.cpp)
+target_link_libraries(bench_core PRIVATE order_book)
+target_include_directories(bench_core PRIVATE bench)
+
+find_package(Threads REQUIRED)
+add_executable(bench_pipe bench/bench_pipe.cpp)
+target_link_libraries(bench_pipe PRIVATE order_book Threads::Threads)
+target_include_directories(bench_pipe PRIVATE bench)
+
+add_executable(bench_tcp bench/bench_tcp.cpp)
+target_link_libraries(bench_tcp PRIVATE order_book Threads::Threads)
+target_include_directories(bench_tcp PRIVATE bench)
+
+# Standalone TCP order-entry gateway.
+add_executable(matching_server src/server_main.cpp)
+target_link_libraries(matching_server PRIVATE order_book Threads::Threads)
+
 # Test suite (dependency-free) wired into CTest.
 enable_testing()
 add_executable(order_book_tests test/test_order_book.cpp)
