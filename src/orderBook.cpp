@@ -63,15 +63,15 @@ void OrderBook::rest(const Order& incoming)
     {
         std::list<Order>& level = bids_[incoming.price];
         level.push_back(incoming);
-        index_[incoming.order_id] =
-            Locator::create(OrderSide::BUY, incoming.price, std::prev(level.end()));
+        index_[incoming.order_id] = Locator::create(
+            OrderSide::BUY, incoming.price, &level, std::prev(level.end()));
     }
     else
     {
         std::list<Order>& level = asks_[incoming.price];
         level.push_back(incoming);
-        index_[incoming.order_id] =
-            Locator::create(OrderSide::SELL, incoming.price, std::prev(level.end()));
+        index_[incoming.order_id] = Locator::create(
+            OrderSide::SELL, incoming.price, &level, std::prev(level.end()));
     }
 }
 
@@ -161,19 +161,17 @@ bool OrderBook::cancel(OrderId id)
 
     const Locator& loc = found->second;
 
-    if (loc.side == OrderSide::BUY)
+    // O(1): the level's address is stored in the Locator, so removing the node
+    // costs no tree descent -- we never look the price up.
+    loc.level->erase(loc.order_iterator);
+
+    // Rare path: that cancel emptied the level, so drop it from the map. This
+    // is the only remaining O(log L) step, and it runs once per level's
+    // lifetime rather than once per cancel.
+    if (loc.level->empty())
     {
-        std::list<Order>& level = bids_.at(loc.price);
-        level.erase(loc.order_iterator);
-        if (level.empty())
-            bids_.erase(loc.price);
-    }
-    else
-    {
-        std::list<Order>& level = asks_.at(loc.price);
-        level.erase(loc.order_iterator);
-        if (level.empty())
-            asks_.erase(loc.price);
+        if (loc.side == OrderSide::BUY) bids_.erase(loc.price);
+        else                            asks_.erase(loc.price);
     }
 
     index_.erase(found);

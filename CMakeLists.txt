@@ -19,6 +19,10 @@ add_executable(bench_core bench/bench_core.cpp)
 target_link_libraries(bench_core PRIVATE order_book)
 target_include_directories(bench_core PRIVATE bench)
 
+add_executable(bench_cancel bench/bench_cancel.cpp)
+target_link_libraries(bench_cancel PRIVATE order_book)
+target_include_directories(bench_cancel PRIVATE bench)
+
 find_package(Threads REQUIRED)
 add_executable(bench_pipe bench/bench_pipe.cpp)
 target_link_libraries(bench_pipe PRIVATE order_book Threads::Threads)

@@ -22,6 +22,7 @@ Design notes and write-ups: [The Latency Log](https://nmesomaanyanwu.hashnode.de
 - [Design decisions](#design-decisions)
 - [Matching semantics](#matching-semantics)
 - [Correctness](#correctness)
+- [Ongoing work](#ongoing-work)
 - [Build and run](#build-and-run)
 - [Limitations](#limitations)
 
@@ -127,6 +128,8 @@ cmake --build build
 ./build/bench_core 10000000 5000 42   # measurement 1
 ./build/bench_pipe  5000000 5000 42   # measurement 2
 ./build/bench_tcp   1000000 5000 42   # measurement 3  (loopback, ~16 s)
+
+./build/bench_cancel                  # cancel cost vs book width (see Ongoing work)
 ```
 
 Arguments are `[num_ops] [target_depth] [seed]`. Numbers above are from a single
@@ -208,8 +211,12 @@ on top of the correctness-first core without editing a line of it.
 - **Price-time priority** across all order types
 - **Maker-price execution** — crossing trades execute at the resting order's price
 - **LIMIT**, **MARKET**, **IOC**, **FOK** (× GTC / Day time-in-force)
-- **O(1) cancellation** via an `OrderId → Locator` index holding stable
-  `std::list` iterators, so a cancel never searches the book
+- **O(1) cancellation** — the `OrderId → Locator` index stores the price
+  level's address alongside a stable `std::list` iterator, so a cancel unlinks
+  the node with no lookup and no scan. Removing a level that a cancel *empties*
+  costs O(log L) in the number of price levels, but that runs once per level's
+  lifetime, not once per cancel. See [Ongoing work](#ongoing-work) for the
+  measurement.
 - **FOK** is pre-checked against crossing liquidity by quantity before any
   mutation, so a kill touches nothing
 
@@ -236,6 +243,125 @@ the isolation boundary actually holds.
 ```bash
 ctest --test-dir build
 ```
+
+---
+
+## Ongoing work
+
+Changes made after the first working version, with the reasoning — and, where
+the change makes a performance claim, the measurement behind it. Status is
+stated per item rather than implied.
+
+### O(1) cancellation — **done, measured**
+
+The original `Locator` stored `{side, price, list_iterator}`. It already held
+the order's exact address, but `cancel()` still had to *find the list* in order
+to call `erase` on it — an iterator doesn't know which container owns it — so
+every cancel paid a `std::map::at` red-black-tree descent, O(log L).
+
+The `Locator` now also stores the level's address directly:
+
+```cpp
+struct Locator {
+    OrderSide side;
+    Price price;                          // only for the empty-level path
+    std::list<Order>* level;              // ← removes the tree descent
+    std::list<Order>::iterator order_iterator;
+};
+```
+
+A raw pointer is correct here because it *observes* rather than owns: `std::map`
+nodes never relocate, and a level is only erased from the map once it is empty —
+at which point no resting order, and therefore no `Locator`, can still reference
+it. That invariant is what makes the pointer safe, and it's stated in the header
+next to the field.
+
+Measured with `bench_cancel`, which isolates the cancel path by cancelling only
+half the orders at each level so no level ever empties:
+
+| price levels | before | after |
+| ---: | ---: | ---: |
+| 16 | 18.9 ns | **10.4 ns** |
+| 64 | 22.5 ns | **13.8 ns** |
+| 256 | 36.9 ns | **19.5 ns** |
+| 1,024 | 61.6 ns | **28.3 ns** |
+| 4,096 | 82.8 ns | **32.9 ns** |
+| 16,384 | 161.8 ns | **93.6 ns** |
+
+> **Measurement conditions differ from the rest of this README.** These numbers
+> were taken on aarch64 Linux with GCC, not on the Apple M5 / Apple clang setup
+> used for the three headline benchmarks. They are included to show the shape of
+> the change, not to be compared against the 84 ns figure. Re-run
+> `./build/bench_cancel` locally for numbers on your own machine.
+
+Roughly 2× across the range. The residual growth is **not** algorithmic — the
+operation count per cancel is constant. It's memory-hierarchy cost: at 16,384
+levels the working set is hundreds of thousands of orders, and randomised cancel
+order defeats prefetching, so each of the three pointer chases can miss cache.
+Big-O counts operations, not nanoseconds.
+
+The 23-test suite passes unchanged.
+
+### RAII for the queue buffer — **done**
+
+`MpscQueue` held its ring in a raw `Cell*` with a matching `delete[]` in the
+destructor. It is now a `std::unique_ptr<Cell[]>`, and the destructor is gone.
+
+Zero overhead — `sizeof(std::unique_ptr<Cell[]>)` is 8 bytes, identical to the
+raw pointer, and the generated code is the same. What it buys is that the
+release is now tied to the object's lifetime rather than to a line of code that
+has to be reached: exception-safe, and the `new[]`/`delete[]` pairing is
+enforced by the type rather than remembered. `bench_pipe` is unchanged
+(p50 0.25 µs) and runs clean under AddressSanitizer and LeakSanitizer.
+
+### RAII for file descriptors — **in progress**
+
+The remaining hand-managed resources are file descriptors. Two real gaps:
+
+```cpp
+listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);   // return value unchecked
+...
+if (::bind(...) != 0) return 0;                    // early return, fd left open
+if (::listen(listen_fd_, 64) != 0) return 0;       // same
+```
+
+and `gateway_loop`'s `::close(fd)` sits at the bottom of the function — correct
+today because there is exactly one exit path, but it becomes a per-connection
+descriptor leak the moment anyone adds an early return.
+
+The plan is a small `UniqueFd` type: exclusive ownership, copy deleted, move
+allowed, `::close()` in the destructor. The same shape as `std::unique_ptr`,
+with an `int` and `close()` in place of a pointer and `delete`.
+
+Deliberately **not** wrapped: `client_fds_` and `Request::fd`. Both are
+non-owning copies — `client_fds_` exists so `stop()` can call `shutdown()` on
+each socket, and `Request::fd` tells the matching thread where to send the ack.
+Wrapping either would give the same descriptor two owners and produce a double
+`close()`, which is worse than a leak: descriptors are recycled, so the second
+close would tear down an unrelated connection.
+
+(`Request::fd` also *cannot* be wrapped — `MpscQueue` static-asserts
+`is_trivially_copyable_v<T>`, and a type with a destructor isn't. The type
+system already refuses to let ownership travel through the queue.)
+
+### Known gaps not yet addressed
+
+- **Duplicate order ids are not rejected.** `rest()` does
+  `index_[order_id] = ...`, and `operator[]` overwrites. Submitting two orders
+  with the same id silently orphans the first: it stays resting and tradeable,
+  but no id reaches it, and a cancel hits the second. Not reachable through the
+  gateway, which mints ids server-side, but `OrderBook` is a standalone unit
+  with an unenforced precondition.
+- **Time priority is under-tested.** Inverting `push_back` to `push_front` in
+  `rest()` — which turns the book from FIFO to LIFO — fails exactly one test
+  (`price_time_priority`, 2 of 109 checks). One of the two properties the book
+  exists to provide is guarded by two assertions.
+- **`next_producer_` is atomic but only ever touched by the single acceptor
+  thread.** Harmless, but defensive rather than necessary; it should say which.
+- **`stop()` relies on join ordering, not locking**, to make `gateways_` safe:
+  the acceptor is joined before that vector is read. Correct, cheaper than a
+  mutex, and currently undocumented — nothing stops someone reordering the two
+  lines.
 
 ---
 

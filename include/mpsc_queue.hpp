@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <type_traits>
 
@@ -42,14 +43,15 @@ public:
         std::size_t cap = 2;
         while (cap < capacity) cap <<= 1;
         mask_ = cap - 1;
-        buffer_ = new Cell[cap];
+        buffer_ = std::make_unique<Cell[]>(cap);
         for (std::size_t i = 0; i < cap; ++i)
             buffer_[i].seq.store(i, std::memory_order_relaxed);
         enqueue_pos_.store(0, std::memory_order_relaxed);
         dequeue_pos_.store(0, std::memory_order_relaxed);
     }
 
-    ~MpscQueue() { delete[] buffer_; }
+    // No destructor needed: unique_ptr<Cell[]> releases the buffer when the
+    // queue dies, on every exit path including an exception.
 
     MpscQueue(const MpscQueue&) = delete;
     MpscQueue& operator=(const MpscQueue&) = delete;
@@ -119,7 +121,7 @@ public:
     }
 
 private:
-    Cell* buffer_ = nullptr;
+    std::unique_ptr<Cell[]> buffer_;
     std::size_t mask_ = 0;
     alignas(kCacheLine) std::atomic<std::size_t> enqueue_pos_;
     alignas(kCacheLine) std::atomic<std::size_t> dequeue_pos_;
